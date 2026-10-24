@@ -2,71 +2,107 @@ import "dotenv/config";
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
-const __dir = path.dirname(fileURLToPath(import.meta.url));
 
-const KEY = process.env.RUNWAY_API_KEY;
-const API = "https://api.dev.runwayml.com/v1";
-const HEAD = {
-  Authorization: `Bearer ${KEY}`,
-  "X-Runway-Version": "2024-11-06",
-  "Content-Type": "application/json",
-};
+const __dir = path.dirname(fileURLToPath(import.meta.url));
+const KEY = process.env.MAGIC_HOUR_API_KEY;
+const API = "https://api.magichour.ai/v1";
+const HEAD = { Authorization: `Bearer ${KEY}`, "Content-Type": "application/json" };
 
 if (!KEY) {
-  console.error("Clé manquante : créez un fichier .env avec RUNWAY_API_KEY=...");
+  console.error("Clé manquante : ajoutez MAGIC_HOUR_API_KEY dans Environment sur Render.");
   process.exit(1);
 }
+
+// Mots du prompt -> style Magic Hour
+const STYLES = [
+  [/ghibli|anime|manga|dessin anim|cartoon/i, "Studio Ghibli"],
+  [/pixar|3d/i, "Pixar"],
+  [/aquarelle|watercolor/i, "Watercolor"],
+  [/peinture|huile|oil/i, "Oil Painting"],
+  [/cyberpunk|n[ée]on/i, "Cyberpunk"],
+  [/comic|bd\b|bande dessin/i, "Comic"],
+  [/van gogh/i, "Van Gogh"],
+  [/lego/i, "Lego"],
+  [/argile|clay/i, "Clay"],
+  [/minecraft/i, "Minecraft"],
+  [/pixel/i, "Pixel"],
+  [/encre|ink/i, "Ink"],
+];
+const pickStyle = (p) => (STYLES.find(([re]) => re.test(p)) || [null, "No Art Style"])[1];
+const EXT = { "video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm", "video/x-m4v": "m4v" };
 
 const app = express();
 app.get("/", (req, res) => res.sendFile(path.join(__dir, "index.html")));
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
-// 1) Reçoit la vidéo brute + le prompt, lance la tâche chez Runway
-app.post(
-  "/api/restyle",
-  express.raw({ type: "video/*", limit: "16mb" }),
-  async (req, res) => {
-    try {
-      console.log("Requête reçue, taille :", req.body?.length || 0, "octets");
-      const prompt = (req.query.prompt || "").toString().trim();
-      if (!prompt) return res.status(400).json({ error: "Prompt manquant." });
-      if (!req.body?.length) return res.status(400).json({ error: "Vidéo manquante." });
+async function mh(url, opts) {
+  const r = await fetch(API + url, { ...opts, headers: HEAD });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.message || `Erreur Magic Hour (${r.status})`);
+  return d;
+}
 
-      const mime = req.headers["content-type"].split(";")[0];
-      const videoUri = `data:${mime};base64,${req.body.toString("base64")}`;
+app.post("/api/restyle", express.raw({ type: "video/*", limit: "20mb" }), async (req, res) => {
+  try {
+    const prompt = (req.query.prompt || "").toString().trim();
+    if (!prompt) return res.status(400).json({ error: "Prompt manquant." });
+    if (!req.body?.length) return res.status(400).json({ error: "Vidéo manquante." });
+    const mime = req.headers["content-type"].split(";")[0];
+    const ext = EXT[mime] || "mp4";
 
-      const r = await fetch(`${API}/video_to_video`, {
-        method: "POST",
-        headers: HEAD,
-        body: JSON.stringify({ model: "gen4_aleph", videoUri, promptText: prompt }),
-      });
-      const data = await r.json();
-      console.log("Réponse Runway :", r.status, JSON.stringify(data).slice(0, 300));
-      if (!r.ok) return res.status(r.status).json({ error: data.error || "Erreur Runway." });
-      res.json({ id: data.id });
-    } catch (e) {
-      res.status(500).json({ error: e.message });
-    }
+    // 1) demander une adresse d'envoi
+    const up = await mh("/files/upload-urls", {
+      method: "POST",
+      body: JSON.stringify({ items: [{ type: "video", extension: ext }] }),
+    });
+    const { upload_url, file_path } = up.items[0];
+
+    // 2) envoyer la vidéo
+    const put = await fetch(upload_url, { method: "PUT", body: req.body });
+    if (!put.ok) throw new Error("Échec de l'envoi de la vidéo (" + put.status + ").");
+
+    // 3) lancer le restyle (5 premières secondes pour économiser les crédits)
+    const style = pickStyle(prompt);
+    console.log("Style choisi :", style);
+    const job = await mh("/video-to-video", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "Restyle IA",
+        start_seconds: 0,
+        end_seconds: 5,
+        fps_resolution: "HALF",
+        style: {
+          art_style: style,
+          version: style === "Studio Ghibli" ? "v2" : "default",
+          prompt_type: "custom",
+          prompt,
+        },
+        assets: { video_source: "file", video_file_path: file_path },
+      }),
+    });
+    console.log("Job créé :", job.id, "crédits :", job.credits_charged);
+    res.json({ id: job.id });
+  } catch (e) {
+    console.error(e.message);
+    res.status(500).json({ error: e.message });
   }
-);
+});
 
-// 2) Le navigateur interroge ce point jusqu'à la fin de la tâche
 app.get("/api/status/:id", async (req, res) => {
   try {
-    const r = await fetch(`${API}/tasks/${encodeURIComponent(req.params.id)}`, { headers: HEAD });
-    const d = await r.json();
-    if (!r.ok) return res.status(r.status).json({ error: d.error || "Erreur Runway." });
+    const d = await mh("/video-projects/" + encodeURIComponent(req.params.id), { method: "GET" });
+    const status =
+      d.status === "complete" ? "SUCCEEDED" :
+      d.status === "error" || d.status === "canceled" ? "FAILED" : d.status.toUpperCase();
     res.json({
-      status: d.status, // PENDING, RUNNING, SUCCEEDED, FAILED...
-      progress: d.progress ?? null,
-      url: d.output?.[0] ?? null,
-      error: d.failure ?? null,
+      status,
+      progress: null,
+      url: d.downloads?.[0]?.url ?? null,
+      error: d.error?.message ?? null,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-app.listen(process.env.PORT || 3000, () =>
-  console.log(`Ouvrez http://localhost:${process.env.PORT || 3000}`)
-);
+app.listen(process.env.PORT || 3000, () => console.log("Serveur prêt"));
